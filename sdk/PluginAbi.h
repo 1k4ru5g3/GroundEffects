@@ -327,6 +327,27 @@ typedef struct {
     int32_t dest_y;
 } ActorActionAbi;
 
+// A ground effect (the "GroundEffect" component on a
+// Metadata/Effects/Spells/ground_effects/VisibleServerGroundEffect entity).
+// Filled by HostAbi::read_ground_effect from an ENTITY address — the host
+// resolves the component and its groundeffects.datc64 row. Lets a plugin tell
+// apart the many same-pathed ground effects (Shocked/Ignited/Caustic/...).
+// The *_addr fields are GAME-process addresses of raw UTF-16 strings: resolve
+// with MemoryService::read_wstring (FetchWString); 0 means that column is unset
+// for this variant. The two *_row fields are raw dat-row pointers (valid for the
+// session) for advanced cross-referencing.
+typedef struct {
+    int32_t   valid;
+    float     radius;                  // world units (e.g. 190.0); 0 = unset by this variant
+    uintptr_t type_id_addr;            // groundeffecttypes.Id — the stable key, e.g. "ShockedGround"
+    uintptr_t end_effect_addr;         // end behaviour: "fadeout" / "close" / "end"
+    uintptr_t buff_visual1_addr;       // buffvisuals.Id, e.g. "ground_fire_burn_white" (0 if unset)
+    uintptr_t buff_visual2_addr;       // buffdefinitions.Name, e.g. "ground_tar_gold" (0 if unset)
+    uintptr_t ao_file_addr;            // first .ao/.aoc visual path (0 if none)
+    uintptr_t ground_effects_row;      // raw groundeffects.datc64 row pointer
+    uintptr_t ground_effect_types_row; // raw groundeffecttypes.datc64 row pointer
+} GroundEffectAbi;
+
 // One monster modifier, read from an ObjectMagicProperties component
 // (HostAbi::enumerate_monster_mods). Lets a plugin identify a monster's rolled
 // mods the instant it spawns — before any related buff is applied. The three
@@ -848,6 +869,11 @@ typedef struct {
     float   unit_chaos;
     float   total_chaos;
     int32_t priced;
+    // --- APPEND-ONLY (rune propagation, 0.5.4). Passed by const ptr per visitor
+    //     callback, so older plugins safely read only the prefix above. ---
+    char    propagating_runes[64];  // rune(s) at this recipe's propagating slot(s); "" if none
+    int32_t propagating_count;      // number of propagating runes for this reward
+    int32_t propagating_has_rare;   // 1 if any propagating rune is rare (idx 23-32)
 } RuneshapeRewardAbi;
 
 typedef struct {
@@ -858,6 +884,9 @@ typedef struct {
     char     anchor_name[32];
     int32_t  reward_count;
     int32_t  best_index;
+    // --- APPEND-ONLY (rune propagation, 0.5.4) ---
+    int32_t  propagating_slots[4];   // raw propagating slot indices; unused entries = -1
+    int32_t  propagating_slot_count; // number of valid entries in propagating_slots (0..4)
 } RuneshapeAbi;
 
 typedef int32_t (*PsdkRuneshapeVisitorFn)(const RuneshapeAbi*, void*);
@@ -966,6 +995,14 @@ typedef struct HostAbi {
     // (2026-06-24).
     int32_t (*read_item_aggregated_stats)(uintptr_t entity_addr, int32_t* out_pairs,
                                           int32_t max_pairs);
+
+    // Read a ground effect from an ENTITY address: the host resolves the
+    // "GroundEffect" component (not in ComponentAddressesAbi, so it takes the
+    // entity address like read_pathfinding) and its groundeffects.datc64 row,
+    // exposing the type Id / radius / visuals so a plugin can distinguish the
+    // many same-pathed VisibleServerGroundEffect entities. Append-only tail
+    // (2026-06-25).
+    int32_t (*read_ground_effect)(uintptr_t entity_addr, GroundEffectAbi* out);
 } HostAbi;
 
 #ifdef __cplusplus

@@ -167,6 +167,17 @@ inline std::wstring FetchWString(uintptr_t addr, const HostAbi* abi) {
     return s;
 }
 
+// Like FetchWString but narrows to std::string. Intended for ASCII-only internal
+// identifiers (dat Ids/paths such as "ShockedGround" or "ground_fire_burn_white");
+// any non-ASCII code unit becomes '?'. Use FetchWString when full Unicode matters.
+inline std::string FetchWStringNarrow(uintptr_t addr, const HostAbi* abi) {
+    std::wstring w = FetchWString(addr, abi);
+    std::string s;
+    s.reserve(w.size());
+    for (wchar_t c : w) s.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // Owned views of the ABI PODs. Each ::FromAbi() copies out of the host struct
 // and resolves string addresses, so instances are self-contained and safe to
@@ -690,6 +701,38 @@ struct MonsterMod {
         m.Hash32         = a.hash32;
         m.GenerationType = a.generation_type;
         return m;
+    }
+};
+
+// A ground effect read from a VisibleServerGroundEffect entity's "GroundEffect"
+// component (ComponentsService::ReadGroundEffect, by ENTITY address). Lets a
+// plugin tell apart the many same-pathed ground effects and draw an accurate
+// world-space area. Match on TypeId — the stable, patch-independent key. The
+// entity's world position comes from the entity itself (Entity / Positioned /
+// Render), so it is not duplicated here.
+struct GroundEffect {
+    bool        Valid = false;
+    std::string TypeId;        // groundeffecttypes.Id — the stable key, e.g. "ShockedGround"
+    float       Radius = 0.f;  // world units (e.g. 190.0); 0 = unset by this variant
+    std::string EndEffect;     // end behaviour: "fadeout" / "close" / "end"
+    std::string BuffVisual1;   // buffvisuals.Id, e.g. "ground_fire_burn_white" (empty if unset)
+    std::string BuffVisual2;   // buffdefinitions.Name, e.g. "ground_tar_gold" (empty if unset)
+    std::string AoFile;        // first .ao/.aoc visual path (empty if none)
+    uintptr_t   GroundEffectsRowAddr = 0;     // raw groundeffects.datc64 row ptr (session-stable)
+    uintptr_t   GroundEffectTypesRowAddr = 0; // raw groundeffecttypes.datc64 row ptr
+
+    static GroundEffect FromAbi(const GroundEffectAbi& a, const HostAbi* abi) {
+        GroundEffect g;
+        g.Valid                    = a.valid != 0;
+        g.Radius                   = a.radius;
+        g.TypeId                   = FetchWStringNarrow(a.type_id_addr, abi);
+        g.EndEffect                = FetchWStringNarrow(a.end_effect_addr, abi);
+        g.BuffVisual1              = FetchWStringNarrow(a.buff_visual1_addr, abi);
+        g.BuffVisual2              = FetchWStringNarrow(a.buff_visual2_addr, abi);
+        g.AoFile                   = FetchWStringNarrow(a.ao_file_addr, abi);
+        g.GroundEffectsRowAddr     = a.ground_effects_row;
+        g.GroundEffectTypesRowAddr = a.ground_effect_types_row;
+        return g;
     }
 };
 
@@ -1618,6 +1661,22 @@ public:
         Chest c = ReadChest(chestAddr);
         return c.Valid && c.IsOpened;
     }
+
+    // Read a ground effect from a VisibleServerGroundEffect entity. Pass the
+    // ENTITY address (Entity::Address), NOT a component address — the host
+    // resolves the "GroundEffect" component itself (it is not in the per-entity
+    // component-address table). Returns an invalid GroundEffect if the entity has
+    // no GroundEffect component, or if the host predates this API (it lives on
+    // the HostAbi tail and is null-checked). Distinguish effects via TypeId, e.g.
+    // "ShockedGround" / "IgnitedGround" / "CausticCloud" / "ChilledGround".
+    GroundEffect ReadGroundEffect(uintptr_t entityAddr) const {
+        if (m_host && m_host->read_ground_effect && entityAddr != 0) {
+            GroundEffectAbi a{};
+            if (m_host->read_ground_effect(entityAddr, &a))
+                return GroundEffect::FromAbi(a, m_host);
+        }
+        return {};
+    }
 };
 
 // Inventories, their items, and item-detail lookups. Reached as ctx()->Inventory.
@@ -2355,6 +2414,7 @@ struct Runeshape {
     std::string anchorName;
     int         rewardCount = 0;
     int         bestIndex   = -1;
+    std::vector<int> propagatingSlots;  // slot(s) whose rune propagates (0.5.4)
 };
 
 // One reward slot for a Runeshape device.
@@ -2364,6 +2424,10 @@ struct RuneshapeReward {
     float       unitChaos  = 0.f;
     float       totalChaos = 0.f;
     bool        priced     = false;
+    // Rune propagation (0.5.4): rune(s) at this recipe's propagating slot(s).
+    std::string propagatingRunes;            // e.g. "Power" / "Cold, Time"; "" if none
+    int         propagatingCount   = 0;
+    bool        propagatingHasRare = false;  // any propagating rune is rare ("purple")
 };
 
 // Runeshape devices and their per-entity reward lists.
@@ -2394,6 +2458,8 @@ public:
                 r.anchorName = a->anchor_name;  // NUL-terminated char buffer
                 r.rewardCount = a->reward_count;
                 r.bestIndex  = a->best_index;
+                for (int i = 0; i < a->propagating_slot_count && i < 4; ++i)
+                    r.propagatingSlots.push_back(a->propagating_slots[i]);
                 p->out->push_back(std::move(r));
                 return 1;
             },
@@ -2416,6 +2482,9 @@ public:
                 r.unitChaos  = a->unit_chaos;
                 r.totalChaos = a->total_chaos;
                 r.priced     = a->priced != 0;
+                r.propagatingRunes   = a->propagating_runes;  // NUL-terminated
+                r.propagatingCount   = a->propagating_count;
+                r.propagatingHasRare = a->propagating_has_rare != 0;
                 p->out->push_back(std::move(r));
                 return 1;
             },
